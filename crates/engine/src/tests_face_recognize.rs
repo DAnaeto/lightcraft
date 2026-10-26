@@ -159,8 +159,9 @@ fn indexing_embeds_each_face_once_and_reports_progress() {
 #[test]
 fn suggestions_come_from_the_named_faces_and_are_never_applied() {
     let d = temp("suggest");
-    let (mut s, _) = setup(&d, 64);
-    let (a, b) = two_photos(&s);
+    // Gallery and candidate semantics need real embeddings, not full 24 MP demo renders.
+    let (mut s, _) = fresh_library(&d, 64);
+    let (a, b, _) = import_three_photos(&mut s, &d);
     set_regions(&mut s, a, vec![region(0.1, Some("Ann"))]);
     set_regions(&mut s, b, vec![region(0.1, None), region(0.5, Some("Pet?")), region(0.7, None)]);
     // thresholds that accept anything: Ann is the only person with a named face except "Pet?"
@@ -286,8 +287,9 @@ fn without_a_chosen_model_recognition_says_so() {
 #[test]
 fn the_background_pump_indexes_by_itself_once_recognition_is_on() {
     let d = temp("pump");
-    let (mut s, _) = setup(&d, 64);
-    let (a, b) = two_photos(&s);
+    // Exercise real background embedding without unrelated full 24 MP demo renders.
+    let (mut s, _) = fresh_library(&d, 64);
+    let (a, b, _) = import_three_photos(&mut s, &d);
     set_regions(&mut s, a, vec![region(0.1, Some("Ann")), region(0.5, None)]);
     set_regions(&mut s, b, vec![region(0.3, None)]);
     // installing the model switched recognition on; switched off, the pump does nothing, and says so

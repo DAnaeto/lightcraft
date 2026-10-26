@@ -1234,6 +1234,14 @@ mod tests {
         assert_eq!(r["ok"], true, "{r}");
         h.step();
         assert!(matches!(&h.app.ui.dialog, Some(Dialog::FaceModel { accepted: true, .. })));
+        // Consent is accepted, but no model is installed until confirmation. Keep this UI
+        // fixture on the CPU so it does not start an unrelated background GPU probe.
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("settings.json"), br#"{"cpuOnly":true}"#).unwrap();
+        assert_eq!(h.app.session.execute("faces.gpu", &json!({})).unwrap()["cpuOnly"], true);
+        let before_confirm = h.app.session.execute("faces.models.list", &json!({})).unwrap();
+        assert!(before_confirm["models"].as_array().unwrap().iter().all(|m| m["installed"] != true), "{before_confirm}");
         let r = h.request("ui.dialog.confirm", json!({}), t);
         assert_eq!(r["ok"], true, "{r}");
         let listed = h.app.run("faces.models.list", json!({})).unwrap();
@@ -1342,7 +1350,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lc-ui-facesetup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        h.app.session.face_models_dir = Some(dir.join("models"));
+        // The setup offer tests recognition controls, not GPU attachment. Seed only this
+        // fixture's settings before any model can load, without detaching a shared detector.
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("settings.json"), br#"{"cpuOnly":true}"#).unwrap();
+        h.app.session.face_models_dir = Some(models);
+        assert_eq!(h.app.session.execute("faces.gpu", &json!({})).unwrap()["cpuOnly"], true);
         let runtime = h.app.session.execute("faces.models.list", &json!({})).unwrap()["runtime"] == true;
         let id = h.app.session.active().unwrap();
         let mut meta = h.app.session.catalog.photo(id).unwrap().meta.clone();
