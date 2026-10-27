@@ -11,7 +11,11 @@ pub trait QueuedDrops {
     type Pending;
     /// Whether a prompt or the blocking library window owns input right now.
     fn drops_wait(&self) -> bool;
+    /// Record that all currently unread handles are held by this foreground barrier.
+    fn defer_dropped(&mut self);
     fn take_dropped(&mut self) -> Vec<Self::Dropped>;
+    /// Take fresh arrivals only, retaining handles protected by an earlier foreground barrier.
+    fn take_unprotected_dropped(&mut self) -> Vec<Self::Dropped>;
     fn take_pending(&mut self) -> Vec<Self::Pending>;
 }
 
@@ -32,13 +36,15 @@ pub struct Drained<D, P> {
 }
 
 /// The actual queue drain `WebApp` runs each UI pass: while [`drops_wait`] holds, neither queue is
-/// touched. Once ready, the dropped-file queue is taken first; if those handles are refused behind
-/// a dialog (`dialog_open`), the stored originals are left queued as well.
+/// touched. With an ordinary dialog open, only fresh handles are taken for refusal; earlier
+/// barrier-held handles remain queued. If fresh handles are refused, stored originals are left
+/// queued as well. Otherwise the existing stored-original drain policy is unchanged.
 pub fn drain_ready<Q: QueuedDrops>(queues: &mut Q, dialog_open: bool) -> Option<Drained<Q::Dropped, Q::Pending>> {
     if queues.drops_wait() {
+        queues.defer_dropped();
         return None;
     }
-    let dropped = queues.take_dropped();
+    let dropped = if dialog_open { queues.take_unprotected_dropped() } else { queues.take_dropped() };
     let pending = if !dropped.is_empty() && dialog_open { None } else { Some(queues.take_pending()) };
     Some(Drained { dropped, pending })
 }
@@ -77,12 +83,13 @@ mod tests {
     struct FakeQueues {
         app: LightcraftApp,
         dropped: Vec<String>,
+        protected: usize,
         pending: Vec<String>,
     }
 
     impl FakeQueues {
         fn new(app: LightcraftApp) -> Self {
-            Self { app, dropped: vec!["dropped-photo".into()], pending: vec!["web/hash/photo.png".into()] }
+            Self { app, dropped: vec!["dropped-photo".into()], protected: 0, pending: vec!["web/hash/photo.png".into()] }
         }
     }
 
@@ -94,8 +101,17 @@ mod tests {
             drops_wait(&self.app)
         }
 
+        fn defer_dropped(&mut self) {
+            self.protected = self.dropped.len();
+        }
+
         fn take_dropped(&mut self) -> Vec<Self::Dropped> {
+            self.protected = 0;
             std::mem::take(&mut self.dropped)
+        }
+
+        fn take_unprotected_dropped(&mut self) -> Vec<Self::Dropped> {
+            self.dropped.split_off(self.protected.min(self.dropped.len()))
         }
 
         fn take_pending(&mut self) -> Vec<Self::Pending> {
@@ -186,5 +202,190 @@ mod tests {
         queues.pending.push("web/hash/late.png".into());
         assert!(drain_ready(&mut queues, false).is_none(), "a prompt still owns input");
         assert_eq!((queues.dropped.len(), queues.pending.len()), (1, 1), "the prompt left both queues alone");
+    }
+
+    /// Uses the product's actual raw-handle queue and provenance APIs. Only the stored-original
+    /// vector is host-owned; there is no test copy of protected-prefix bookkeeping or policy.
+    struct RealAppQueues {
+        h: lightcraft_ui_egui::headless::Headless,
+        pending: Vec<String>,
+        pending_takes: usize,
+    }
+
+    impl QueuedDrops for RealAppQueues {
+        type Dropped = egui::DroppedFileHandle;
+        type Pending = String;
+
+        fn drops_wait(&self) -> bool {
+            drops_wait(&self.h.app)
+        }
+
+        fn defer_dropped(&mut self) {
+            self.h.app.defer_dropped_files();
+        }
+
+        fn take_dropped(&mut self) -> Vec<Self::Dropped> {
+            self.h.app.take_dropped_files()
+        }
+
+        fn take_unprotected_dropped(&mut self) -> Vec<Self::Dropped> {
+            self.h.app.take_unprotected_dropped_files()
+        }
+
+        fn take_pending(&mut self) -> Vec<Self::Pending> {
+            self.pending_takes += 1;
+            std::mem::take(&mut self.pending)
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnreadDrop {
+        path: std::path::PathBuf,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl egui::DroppedFile for UnreadDrop {
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("the queue gate must not read dropped bytes".into())
+        }
+    }
+
+    fn unread(path: &str) -> (egui::DroppedFileHandle, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = std::sync::Arc::new(UnreadDrop { path: path.into(), reads: reads.clone() });
+        (handle, reads)
+    }
+
+    fn queue_raw(queues: &mut RealAppQueues, handles: &[egui::DroppedFileHandle]) {
+        let mut raw = egui::RawInput { dropped_files: handles.to_vec(), ..Default::default() };
+        queues.h.app.raw_input_hook(&queues.h.view.ctx, &mut raw);
+        assert!(raw.dropped_files.is_empty(), "the product takes raw ownership once");
+    }
+
+    fn hold_library(queues: &mut RealAppQueues) -> Result<(), String> {
+        let mut problem = LibraryProblem::choose_later(&queues.h.app.ui.settings);
+        problem.chooser.as_mut().ok_or("the launch list has no chooser")?.over = Some(queues.h.app.session.library_generation());
+        queues.h.app.library_problem = Some(problem);
+        Ok(())
+    }
+
+    fn real_queues(tag: &str) -> Result<(Scratch, RealAppQueues), String> {
+        let (dir, app) = app_with_library(tag)?;
+        let h = lightcraft_ui_egui::headless::Headless::new(app, [1300.0, 900.0], 1.0);
+        Ok((dir, RealAppQueues { h, pending: vec!["web/hash/stored.png".into()], pending_takes: 0 }))
+    }
+
+    fn protect(queues: &mut RealAppQueues, handle: &egui::DroppedFileHandle) -> Result<(), String> {
+        hold_library(queues)?;
+        queue_raw(queues, std::slice::from_ref(handle));
+        // WebApp's gate runs before App.ui, including the cold first frame. The gate
+        // itself must establish provenance; a warmed native UI pass cannot stand in for it.
+        assert_eq!(queues.h.frames(), 0, "this starts before the first native UI pass");
+        assert!(drops_wait(&queues.h.app));
+        assert!(drain_ready(queues, false).is_none());
+        assert_eq!(queues.h.frames(), 0, "the host gate protects ownership without drawing");
+        assert_eq!(queues.pending_takes, 0);
+        assert!(queues.h.app.scan.is_none() && queues.h.app.import.is_none());
+        assert_eq!(queues.h.app.session.catalog.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn real_unread_barrier_drop_survives_a_dialog_while_stored_originals_finish() {
+        let (_dir, mut queues) = real_queues("real-held-dialog").expect("create real-queue library");
+        let (a, reads) = unread("A.png");
+        protect(&mut queues, &a).expect("hold the library barrier");
+        queues.h.app.library_problem = None;
+        queues.h.app.ui.dialog = Some(Dialog::WhatsNew);
+        // WebApp drains BEFORE App.ui. A native UI pass here would conceal the host-order bug.
+        let got = drain_ready(&mut queues, true).expect("only the ordinary dialog remains");
+        assert!(got.dropped.is_empty(), "the earlier unread A must not be drained for dialog refusal");
+        assert_eq!(
+            got.pending,
+            Some(vec!["web/hash/stored.png".into()]),
+            "with no fresh refusal, earlier stored originals retain their existing completion policy"
+        );
+        assert_eq!(queues.pending_takes, 1);
+        let again = drain_ready(&mut queues, true).unwrap();
+        assert!(again.dropped.is_empty(), "A stays protected across another host pass");
+        queues.h.app.ui.dialog = None;
+        let released = drain_ready(&mut queues, false).unwrap();
+        assert_eq!(released.dropped.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(&released.dropped[0], &a), "the original A handle is released");
+        assert!(drain_ready(&mut queues, false).unwrap().dropped.is_empty(), "A transfers exactly once");
+        assert!(queues.h.app.take_dropped_files().is_empty());
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn real_fresh_dialog_drop_is_refused_without_consuming_protected_or_stored_files() {
+        let (_dir, mut queues) = real_queues("real-mixed-dialog").expect("create real-queue library");
+        let (a, reads_a) = unread("A.png");
+        let (b, reads_b) = unread("B.png");
+        protect(&mut queues, &a).expect("hold the library barrier");
+        queues.h.app.library_problem = None;
+        queues.h.app.ui.dialog = Some(Dialog::WhatsNew);
+        queue_raw(&mut queues, std::slice::from_ref(&b));
+        let got = drain_ready(&mut queues, true).unwrap();
+        assert_eq!(got.dropped.len(), 1, "only fresh B is offered to the browser's existing refusal branch");
+        assert!(std::sync::Arc::ptr_eq(&got.dropped[0], &b));
+        assert_eq!(got.pending, None, "refusing B must not consume stored originals");
+        assert_eq!(queues.pending_takes, 0);
+        assert_eq!(queues.pending, vec!["web/hash/stored.png".to_string()]);
+        assert!(matches!(queues.h.app.ui.dialog, Some(Dialog::WhatsNew)));
+        queues.h.app.ui.dialog = None;
+        let released = drain_ready(&mut queues, false).unwrap();
+        assert_eq!(released.dropped.len(), 1, "protected A survived B's refusal");
+        assert!(std::sync::Arc::ptr_eq(&released.dropped[0], &a));
+        assert_eq!(released.pending, Some(vec!["web/hash/stored.png".into()]));
+        let empty = drain_ready(&mut queues, false).unwrap();
+        assert!(empty.dropped.is_empty());
+        assert_eq!(empty.pending, Some(Vec::<String>::new()));
+        assert_eq!(reads_a.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(reads_b.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Consuming A clears its protection: a later ordinary drop is still fresh.
+        let (c, reads_c) = unread("C.png");
+        queues.h.app.ui.dialog = Some(Dialog::WhatsNew);
+        queue_raw(&mut queues, std::slice::from_ref(&c));
+        let fresh = drain_ready(&mut queues, true).unwrap();
+        assert_eq!(fresh.dropped.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(&fresh.dropped[0], &c));
+        assert_eq!(fresh.pending, None);
+        queues.h.app.ui.dialog = None;
+        assert!(drain_ready(&mut queues, false).unwrap().dropped.is_empty());
+        assert_eq!(reads_c.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn real_protected_drops_keep_order_through_barrier_reentry_and_transfer_once() {
+        let (_dir, mut queues) = real_queues("real-reentered").expect("create real-queue library");
+        let (a, reads_a) = unread("A.png");
+        let (b, reads_b) = unread("B.png");
+        protect(&mut queues, &a).expect("hold the library barrier");
+        queues.h.app.library_problem = None;
+        queues.h.app.ui.dialog = Some(Dialog::WhatsNew);
+        assert!(drain_ready(&mut queues, true).unwrap().dropped.is_empty());
+        queues.h.app.ui.dialog = None;
+        hold_library(&mut queues).expect("reenter the library barrier"); // Before a pass can consume A.
+        queue_raw(&mut queues, std::slice::from_ref(&b));
+        assert!(drain_ready(&mut queues, false).is_none(), "the reentered host gate protects B before native UI");
+        assert_eq!(queues.h.frames(), 0, "neither protected arrival depends on font readiness or a completed UI pass");
+        queues.h.app.library_problem = None;
+        queues.h.app.ui.dialog = Some(Dialog::WhatsNew);
+        assert!(drain_ready(&mut queues, true).unwrap().dropped.is_empty(), "both real barrier arrivals remain protected");
+        queues.h.app.ui.dialog = None;
+        let released = drain_ready(&mut queues, false).unwrap();
+        assert_eq!(released.dropped.len(), 2);
+        assert!(std::sync::Arc::ptr_eq(&released.dropped[0], &a));
+        assert!(std::sync::Arc::ptr_eq(&released.dropped[1], &b));
+        assert!(drain_ready(&mut queues, false).unwrap().dropped.is_empty());
+        assert!(queues.h.app.take_dropped_files().is_empty());
+        assert_eq!(reads_a.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(reads_b.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

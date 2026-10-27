@@ -2125,7 +2125,7 @@ impl LightcraftApp {
         // only holds them back until then. Mark those drops: once the barrier opens they may find
         // a dialog, Lightroom import or import that the library's own open started still running.
         if panels::notices::blocks_input(self) || panels::library_problem::blocks_file_drops(self) {
-            self.deferred_dropped_file_count = self.dropped_files.len();
+            self.defer_dropped_files();
         } else {
             self.import_dropped_files(ctx);
         }
@@ -2138,12 +2138,28 @@ impl LightcraftApp {
         }
     }
 
+    /// Preserve the currently queued handles while a prompt or blocking library window owns
+    /// drops. Hosts call this in their UI phase even if the app is not ready to draw yet.
+    pub fn defer_dropped_files(&mut self) {
+        self.deferred_dropped_file_count = self.dropped_files.len();
+    }
+
     /// Take the host's dropped files, exactly once. The queue is filled by `raw_input_hook`, so a
     /// hidden logic tick can never replay the last pass's drop. Web hosts call this in their UI
     /// phase (they need `bytes_async`, which is not available on a native file path).
     pub fn take_dropped_files(&mut self) -> Vec<egui::DroppedFileHandle> {
         self.deferred_dropped_file_count = 0;
         std::mem::take(&mut self.dropped_files)
+    }
+
+    /// Take only drops that did not wait behind a prompt or blocking library window.
+    /// Hosts call this in the UI phase to refuse fresh arrivals behind an ordinary dialog
+    /// while preserving the earlier protected prefix for a later pass.
+    pub fn take_unprotected_dropped_files(&mut self) -> Vec<egui::DroppedFileHandle> {
+        if self.deferred_dropped_file_count == 0 {
+            return self.take_dropped_files();
+        }
+        self.dropped_files.split_off(self.deferred_dropped_file_count.min(self.dropped_files.len()))
     }
 
     /// Import native drops as presets, face models or photos.
@@ -2160,7 +2176,7 @@ impl LightcraftApp {
             // under the current dialog/import policy instead of inheriting that protection.
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let fresh = self.dropped_files.split_off(self.deferred_dropped_file_count.min(self.dropped_files.len()));
+                let fresh = self.take_unprotected_dropped_files();
                 self.handle_dropped_files(ctx, fresh);
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(100));

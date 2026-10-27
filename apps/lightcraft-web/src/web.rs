@@ -432,8 +432,16 @@ impl crate::drop_gate::QueuedDrops for WebApp {
         crate::drop_gate::drops_wait(&self.app)
     }
 
+    fn defer_dropped(&mut self) {
+        self.app.defer_dropped_files();
+    }
+
     fn take_dropped(&mut self) -> Vec<Self::Dropped> {
         self.app.take_dropped_files()
+    }
+
+    fn take_unprotected_dropped(&mut self) -> Vec<Self::Dropped> {
+        self.app.take_unprotected_dropped_files()
     }
 
     fn take_pending(&mut self) -> Vec<Self::Pending> {
