@@ -939,3 +939,171 @@ fn photos_dropped_with_no_library_open_wait_for_one() {
     let toast = h.app.ui.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
     assert!(toast.contains("drop the presets again"), "{toast}");
 }
+
+/// Finish the protected batch through the ordinary review/direct path, checking exact provenance.
+fn finish_mixed_drop_batch(h: &mut Headless, expected: &[String], direct: bool) {
+    if !direct {
+        assert!(h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(Dialog::Import { .. }))), "the protected batch reaches review");
+        let Some(Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no import review") };
+        let mut actual = opts.candidates.iter().map(|c| c.path.clone()).collect::<Vec<_>>();
+        actual.sort();
+        let mut wanted = expected.to_vec();
+        wanted.sort();
+        assert_eq!(actual, wanted, "review contains exactly the protected arrivals");
+        assert_eq!(photos(h), 0, "review mode still requires confirmation");
+        let reply = h.request("ui.dialog.confirm", json!({}), T);
+        assert_eq!(reply["ok"], true, "{reply}");
+    }
+    assert!(h.step_until(SETTLE, |h| photos(h) == expected.len() && !crate::import::running(&h.app)), "the protected batch imports");
+    let mut paths = h
+        .app
+        .session
+        .catalog
+        .photos()
+        .map(|p| match &p.source {
+            lightcraft_catalog::Source::File { path } => path.clone(),
+            other => panic!("unexpected imported source: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut wanted = expected.to_vec();
+    wanted.sort();
+    assert_eq!(paths, wanted, "only protected files entered the catalog");
+    assert!(h.app.dropped_files.is_empty(), "the protected arrivals were consumed");
+    let revision = h.app.session.catalog.revision;
+    // Inspect every later pass, not only the final catalog count: duplicate import suppression
+    // must not disguise replay of a consumed raw-input drop.
+    for _ in 0..60 {
+        h.step();
+        assert!(!crate::import::running(&h.app), "no replay starts another scan/import");
+        assert!(h.app.ui.dialog.is_none(), "no replay opens another review");
+        assert!(h.app.dropped_files.is_empty());
+        assert_eq!(photos(h), expected.len());
+        assert_eq!(h.app.session.catalog.revision, revision, "no later import mutates the catalog");
+    }
+}
+
+#[test]
+fn a_new_drop_outside_the_barrier_is_refused_while_an_older_drop_waits_for_a_dialog() {
+    for direct in [false, true] {
+        let dir = Scratch::new("mixed-provenance-dialog");
+        let mut h = app_with_library(&dir);
+        h.app.ui.settings.import_dropped_directly = direct;
+        let a = dir.path("trip/a.png");
+        let b = dir.path("trip/b.png");
+        show_launch_list(&mut h);
+        drop_files(&mut h, std::slice::from_ref(&a), false);
+        assert_eq!(h.app.dropped_files.len(), 1);
+        h.app.library_problem = None;
+        h.app.ui.dialog = Some(Dialog::WhatsNew);
+        h.step();
+        assert!(!crate::panels::library_problem::blocks_file_drops(&h.app));
+        assert!(!crate::panels::notices::blocks_input(&h.app));
+        drop_files(&mut h, &[b], false);
+        assert!(matches!(h.app.ui.dialog, Some(Dialog::WhatsNew)), "the ordinary dialog survives B");
+        assert!(h.app.scan.is_none() && h.app.import.is_none());
+        assert_eq!(photos(&h), 0);
+        assert!(h.app.ui.toast.as_ref().is_some_and(|t| t.0.contains("Close the open dialog")), "B is refused immediately: {:?}", h.app.ui.toast);
+        assert_eq!(h.app.dropped_files.len(), 1, "B cannot inherit A's protected provenance");
+        h.app.ui.dialog = None;
+        finish_mixed_drop_batch(&mut h, &[a], direct);
+    }
+}
+
+#[test]
+fn a_new_drop_outside_the_barrier_is_refused_while_an_older_drop_waits_for_an_import() {
+    for direct in [false, true] {
+        let dir = Scratch::new("mixed-provenance-import");
+        let mut h = app_with_library(&dir);
+        h.app.ui.settings.import_dropped_directly = direct;
+        let a = dir.path("trip/a.png");
+        let b = dir.path("trip/b.png");
+        show_launch_list(&mut h);
+        drop_files(&mut h, std::slice::from_ref(&a), false);
+        let stalled = crate::import::stall_scan(&mut h.app);
+        h.app.library_problem = None;
+        h.step();
+        assert!(!crate::panels::library_problem::blocks_file_drops(&h.app));
+        assert!(!crate::panels::notices::blocks_input(&h.app));
+        drop_files(&mut h, &[b], false);
+        assert!(h.app.scan.is_some() && h.app.import.is_none(), "the original stalled import scan survives B");
+        assert!(h.app.ui.dialog.is_none());
+        assert_eq!(photos(&h), 0);
+        assert!(h.app.ui.toast.as_ref().is_some_and(|t| t.0.contains("An import is running")), "B is refused immediately: {:?}", h.app.ui.toast);
+        assert_eq!(h.app.dropped_files.len(), 1, "B cannot inherit A's protected provenance");
+        drop(stalled); // Channel-only fixture: no worker/process to stop.
+        assert!(h.step_until(T, |h| h.app.scan.is_none()), "the original stalled scan ends");
+        finish_mixed_drop_batch(&mut h, &[a], direct);
+    }
+}
+
+#[test]
+fn both_drops_really_made_behind_the_barrier_remain_protected() {
+    for direct in [false, true] {
+        let dir = Scratch::new("mixed-provenance-both-protected");
+        let mut h = app_with_library(&dir);
+        h.app.ui.settings.import_dropped_directly = direct;
+        let a = dir.path("trip/a.png");
+        let b = dir.path("trip/b.png");
+        show_launch_list(&mut h);
+        drop_files(&mut h, std::slice::from_ref(&a), false);
+        drop_files(&mut h, std::slice::from_ref(&b), false);
+        assert_eq!(h.app.dropped_files.len(), 2, "both arrivals really occurred behind the barrier");
+        h.app.library_problem = None;
+        h.app.ui.dialog = Some(Dialog::WhatsNew);
+        for _ in 0..10 {
+            h.step();
+        }
+        assert!(matches!(h.app.ui.dialog, Some(Dialog::WhatsNew)));
+        assert_eq!(h.app.dropped_files.len(), 2, "both protected arrivals survive the later dialog");
+        assert!(h.app.scan.is_none() && h.app.import.is_none());
+        h.app.ui.dialog = None;
+        finish_mixed_drop_batch(&mut h, &[a, b], direct);
+    }
+}
+
+/// Public take also serves web hosts: barrier reentry preserves order and consuming clears
+/// protection, so a later ordinary drop cannot inherit the consumed batch's provenance.
+#[test]
+fn public_drop_take_preserves_reentered_barrier_order_and_clears_protection() {
+    let dir = Scratch::new("mixed-provenance-public-take");
+    let mut h = app_with_library(&dir);
+    let a = dir.path("trip/a.png");
+    let b = dir.path("trip/b.png");
+    show_launch_list(&mut h);
+    drop_files(&mut h, std::slice::from_ref(&a), false);
+    assert_eq!(h.app.dropped_files.len(), 1);
+    h.app.library_problem = None;
+    h.app.ui.dialog = Some(Dialog::WhatsNew);
+    for _ in 0..3 {
+        h.step();
+    }
+    assert_eq!(h.app.dropped_files.len(), 1, "A remains held behind the ordinary dialog");
+    assert!(matches!(h.app.ui.dialog, Some(Dialog::WhatsNew)));
+    // Reenter before any pass without a blocker can consume A.
+    h.app.ui.dialog = None;
+    show_launch_list(&mut h);
+    drop_files(&mut h, std::slice::from_ref(&b), false);
+    assert_eq!(h.app.dropped_files.len(), 2);
+    assert_eq!(photos(&h), 0);
+    assert!(h.app.scan.is_none() && h.app.import.is_none());
+    // Match the web ownership boundary without stepping a native consuming pass.
+    h.app.library_problem = None;
+    let taken = h.app.take_dropped_files();
+    let paths = taken.iter().map(|f| egui::DroppedFile::path(f.as_ref()).to_string_lossy().into_owned()).collect::<Vec<_>>();
+    assert_eq!(paths, vec![a.clone(), b], "public take preserves arrival order through barrier reentry");
+    assert!(h.app.take_dropped_files().is_empty(), "ownership transfers only once");
+    h.app.ui.dialog = Some(Dialog::WhatsNew);
+    drop_files(&mut h, &[a], false);
+    assert!(matches!(h.app.ui.dialog, Some(Dialog::WhatsNew)));
+    assert!(h.app.ui.toast.as_ref().is_some_and(|t| t.0.contains("Close the open dialog")), "consumed protection cannot shelter a later drop");
+    assert!(h.app.dropped_files.is_empty());
+    h.app.ui.dialog = None;
+    for _ in 0..60 {
+        h.step();
+        assert!(h.app.dropped_files.is_empty());
+        assert!(!crate::import::running(&h.app));
+        assert!(h.app.ui.dialog.is_none());
+        assert_eq!(photos(&h), 0, "neither taken handles nor refused arrivals replay");
+    }
+}

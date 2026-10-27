@@ -448,10 +448,10 @@ pub struct LightcraftApp {
     slideshow_auto_paused: bool,
     /// Files dropped since the last UI pass, consumed exactly once by the UI phase.
     dropped_files: Vec<egui::DroppedFileHandle>,
-    /// `dropped_files` arrived while a prompt, the library window or its picker held drops back:
-    /// they are preserved through a dialog, Lightroom import, running Synchronize Folder or import
-    /// instead of taking the ordinary refusal path (which applies to a drop made outside the barrier).
-    deferred_dropped_files: bool,
+    /// Prefix of `dropped_files` that arrived behind a prompt, library window or its picker.
+    /// Preserve only this prefix through subsequent dialogs/imports; later arrivals still take
+    /// the ordinary refusal path unless they too arrive while the original barrier is up.
+    deferred_dropped_file_count: usize,
     /// A synthetic batch was injected into a pass and has not been consumed by a completed
     /// (nondiscarded) UI pass yet: a hidden logic tick must not inject another one.
     synthetic_in_flight: bool,
@@ -640,7 +640,7 @@ impl LightcraftApp {
             slideshow_hidden_at: None,
             slideshow_auto_paused: false,
             dropped_files: vec![],
-            deferred_dropped_files: false,
+            deferred_dropped_file_count: 0,
             synthetic_in_flight: false,
             ui_passes: 0,
             #[cfg(test)]
@@ -2125,9 +2125,7 @@ impl LightcraftApp {
         // only holds them back until then. Mark those drops: once the barrier opens they may find
         // a dialog, Lightroom import or import that the library's own open started still running.
         if panels::notices::blocks_input(self) || panels::library_problem::blocks_file_drops(self) {
-            if !self.dropped_files.is_empty() {
-                self.deferred_dropped_files = true;
-            }
+            self.deferred_dropped_file_count = self.dropped_files.len();
         } else {
             self.import_dropped_files(ctx);
         }
@@ -2144,7 +2142,7 @@ impl LightcraftApp {
     /// hidden logic tick can never replay the last pass's drop. Web hosts call this in their UI
     /// phase (they need `bytes_async`, which is not available on a native file path).
     pub fn take_dropped_files(&mut self) -> Vec<egui::DroppedFileHandle> {
-        self.deferred_dropped_files = false;
+        self.deferred_dropped_file_count = 0;
         std::mem::take(&mut self.dropped_files)
     }
 
@@ -2155,11 +2153,19 @@ impl LightcraftApp {
         // a library open started is still running when the barrier goes. Keep it queued and try
         // the next pass. A drop made outside the barrier keeps the deliberate "close the
         // dialog"/"An import is running" refusal below.
-        if self.deferred_dropped_files && (self.ui.dialog.is_some() || self.lightroom.is_some() || self.sync_run.is_some() || import::running(self)) {
+        if self.deferred_dropped_file_count > 0
+            && (self.ui.dialog.is_some() || self.lightroom.is_some() || self.sync_run.is_some() || import::running(self))
+        {
+            // Only the earlier barrier-held prefix waits. Fresh drops must still be handled
+            // under the current dialog/import policy instead of inheriting that protection.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let fresh = self.dropped_files.split_off(self.deferred_dropped_file_count.min(self.dropped_files.len()));
+                self.handle_dropped_files(ctx, fresh);
+            }
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
             return;
         }
-        self.deferred_dropped_files = false;
         let dropped = self.take_dropped_files();
         if dropped.is_empty() {
             return;
